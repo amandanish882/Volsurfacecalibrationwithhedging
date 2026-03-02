@@ -1,11 +1,11 @@
 <div align="center">
 
 <!-- AI-generated cover — replace with your own banner image -->
-<img src="qr_flow_project/notebooks/ssvi_3d.png" alt="SSVI Volatility Surface" width="700"/>
+<img width="1800" height="1050" alt="03_vol_surface_3d" src="https://github.com/user-attachments/assets/c2d2ec42-c0c6-4c46-8791-9215542bbbae" />
 
 # Arbitrage-Free Volatility Surface & Flow Hedging Optimizer
 
-**Production-lite quantitative pipeline for equity derivatives flow desks**
+**Quantitative pipeline for equity derivatives utilizing surface stochastic volatility inspired**
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](https://isocpp.org)

@@ -3,7 +3,7 @@
 <!-- AI-generated cover — replace with your own banner image -->
 <img width="1800" height="1050" alt="03_vol_surface_3d" src="https://github.com/user-attachments/assets/c2d2ec42-c0c6-4c46-8791-9215542bbbae" />
 
-# Arbitrage-Free Volatility Surface & Flow Hedging Optimizer
+# Arbitrage-Free Volatility Surface & Derivative Hedging Optimizer
 
 **Quantitative pipeline for equity derivatives utilizing surface stochastic volatility inspired**
 

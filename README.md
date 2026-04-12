@@ -6,7 +6,7 @@
 
 # Arbitrage-Free Volatility Surface & Flow Hedging Optimizer
 
-**Production-lite quantitative pipeline for equity derivatives **
+**Production-lite quantitative pipeline for equity derivatives**
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](https://isocpp.org)

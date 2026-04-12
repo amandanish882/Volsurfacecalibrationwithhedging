@@ -96,6 +96,12 @@ PYBIND11_MODULE(qr_engine, m) {
                    "  tol      : convergence tolerance (default 1e-8)\n"
                    "  max_iter : iteration cap (default 100)");
 
+    greeks_mod.def("bs_implied_vol_vec", &greeks::bs_implied_vol_vec,
+                   py::arg("prices"), py::arg("Fs"), py::arg("Ks"),
+                   py::arg("T"), py::arg("r"), py::arg("is_calls"),
+                   py::arg("tol") = 1e-8, py::arg("max_iter") = 100,
+                   "Vectorised implied vol solver over arrays of prices/strikes.");
+
     py::class_<greeks::GreekResult>(greeks_mod, "GreekResult",
         "Full set of finite-difference Greeks for one option.\n\n"
         "Attributes: delta, gamma, vega, theta, vanna, volga")

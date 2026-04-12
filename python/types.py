@@ -106,6 +106,10 @@ class FittedSurface:
         from qr_engine.ssvi import total_variance
         tenors = sorted(self.params_by_tenor.keys())
         thetas = [self.params_by_tenor[t].theta for t in tenors]
+        rhos = [self.params_by_tenor[t].rho for t in tenors]
+        etas = [self.params_by_tenor[t].eta for t in tenors]
         theta_T = float(np.interp(T, tenors, thetas))
-        w = total_variance(k, theta_T, self.global_rho, self.global_eta)
+        rho_T = float(np.interp(T, tenors, rhos))
+        eta_T = float(np.interp(T, tenors, etas))
+        w = total_variance(k, theta_T, rho_T, eta_T)
         return np.sqrt(max(w / T, 1e-12))

@@ -2,268 +2,156 @@
 """
 dividends.py
 ============
-Discrete dividend modeling: historical projection + implied extraction.
-Supports fetching dividend history via yfinance.
+Forward curve construction for equity index options (SPX).
+
+Extracts implied forwards from put-call parity on the option chain,
+bootstraps a continuous dividend yield term structure q(T), and
+provides a continuous forward curve F(T) = S * exp((r(T) - q(T)) * T).
+
+This is the standard sell-side approach: model-free, self-consistent
+with the options market, requires no external dividend data.
 """
 
 import numpy as np
 import pandas as pd
-from python.types import DiscreteDividend, OptionChain, YieldCurve
+from python.types import OptionChain, YieldCurve
 
 
-def fetch_dividends(ticker="SPY", period="3y"):
+class ForwardCurve:
     """
-    Fetch historical dividend data from Yahoo Finance via yfinance.
+    Continuous forward curve bootstrapped from implied forwards.
 
-    Returns a DataFrame with columns ["ex_date", "amount"] suitable
-    for project_from_history().
-
-    Parameters
-    ----------
-    ticker : str, default "SPY"
-    period : str, default "3y" — how far back to fetch
+    Stores the implied dividend yield term structure q(T) and provides
+    forward prices at arbitrary tenors via interpolation.
     """
-    import yfinance as yf
 
-    tk = yf.Ticker(ticker)
-    divs = tk.dividends
-    if divs.empty:
-        raise RuntimeError("No dividend data found for %s" % ticker)
+    def __init__(self, spot, tenors, forwards, div_yields, curve):
+        self.spot = spot
+        self.tenors = np.array(tenors)       # T at each listed expiry
+        self.forwards = np.array(forwards)   # implied F at each expiry
+        self.div_yields = np.array(div_yields)  # q(T) at each expiry
+        self._curve = curve
 
-    # Normalize to tz-naive for consistency with rest of pipeline
-    if divs.index.tz is not None:
-        divs.index = divs.index.tz_localize(None)
+    def forward_at(self, T):
+        """Continuous forward at arbitrary tenor T."""
+        T = max(T, 0.001)
+        q = float(np.interp(T, self.tenors, self.div_yields))
+        r = self._curve.rate(T)
+        return self.spot * np.exp((r - q) * T)
 
-    # Filter to requested period
-    years_back = int(period.replace("y", "")) if period.endswith("y") else 3
-    cutoff = pd.Timestamp.now() - pd.DateOffset(years=years_back)
-    divs = divs[divs.index >= cutoff]
-
-    df = pd.DataFrame({
-        "ex_date": divs.index,
-        "amount": divs.values,
-    }).reset_index(drop=True)
-
-    print("  [dividends] Fetched %d dividends for %s over %s" % (len(df), ticker, period))
-    return df
+    def div_yield_at(self, T):
+        """Interpolated continuous dividend yield at tenor T."""
+        return float(np.interp(max(T, 0.001), self.tenors, self.div_yields))
 
 
-def project_from_history(historical_divs, horizon_years=2.0):
+def _extract_implied_forward(chain, curve, expiry):
     """
-    Project future discrete dividends from historical ex-date schedule.
+    Extract implied forward at a single expiry from near-ATM put-call parity.
 
-    Parameters
-    ----------
-    historical_divs : DataFrame with columns ["ex_date", "amount"]
+    F_implied = K + exp(rT) * (C_mid - P_mid)
+
+    Averages across the 3 nearest-to-ATM strikes with both calls and puts.
+
+    Returns (T, F_implied) or None if insufficient data.
     """
-    historical_divs = historical_divs.copy()
-    historical_divs["ex_date"] = pd.to_datetime(historical_divs["ex_date"])
-    historical_divs = historical_divs.sort_values("ex_date")
+    now = pd.Timestamp.now()
+    T = (expiry - now).days / 365.25
+    if T < 7 / 365.25:
+        return None
 
-    gaps = historical_divs["ex_date"].diff().dropna().dt.days
-    median_gap = gaps.median()
-
-    recent = historical_divs.tail(4)
-    avg_amount = recent["amount"].mean()
-
-    last_ex = historical_divs["ex_date"].iloc[-1]
-    projections = []
-    current = last_ex + pd.Timedelta(days=int(median_gap))
-    cutoff = pd.Timestamp.now() + pd.Timedelta(days=int(horizon_years * 365))
-
-    while current <= cutoff:
-        if current > pd.Timestamp.now():
-            projections.append(DiscreteDividend(
-                ex_date=current, amount=avg_amount, source="historical"
-            ))
-        current += pd.Timedelta(days=int(median_gap))
-
-    return projections
-
-
-def extract_implied_dividends(chain, curve):
-    """
-    Extract market-implied discrete dividends from put-call parity per expiry.
-
-    At each expiry T:
-        F_implied = (C - P) * e^{rT} + K
-        PV(Divs to T) = S - F_implied * e^{-rT}
-    """
+    r = curve.rate(T)
     S = chain.spot
-    implied_divs = {}
 
-    for expiry in chain.expiries():
-        T = (expiry - pd.Timestamp.now()).days / 365.25
-        if T < 7 / 365.25:
-            continue
+    calls = {}
+    puts = {}
+    for q in chain.for_expiry(expiry):
+        if q.is_call:
+            calls[q.strike] = q
+        else:
+            puts[q.strike] = q
 
-        r = curve.rate(T)
-        calls = {}
-        puts = {}
-        for q in chain.for_expiry(expiry):
-            if q.is_call:
-                calls[q.strike] = q
-            else:
-                puts[q.strike] = q
+    common_strikes = sorted(set(calls.keys()) & set(puts.keys()))
+    if len(common_strikes) < 2:
+        return None
 
-        common_strikes = sorted(set(calls.keys()) & set(puts.keys()))
-        if not common_strikes:
-            continue
+    # Pick 3 nearest-to-ATM strikes
+    atm_strikes = sorted(common_strikes, key=lambda k: abs(k - S))[:3]
 
-        atm_strikes = sorted(common_strikes, key=lambda k: abs(k - S))[:3]
+    implied_forwards = []
+    for K in atm_strikes:
+        c_mid = calls[K].mid()
+        p_mid = puts[K].mid()
+        F = K + np.exp(r * T) * (c_mid - p_mid)
+        if F > 0:
+            implied_forwards.append(F)
 
-        forwards = []
-        for K in atm_strikes:
-            c_mid = calls[K].mid()
-            p_mid = puts[K].mid()
-            F_implied = (c_mid - p_mid) * np.exp(r * T) + K
-            forwards.append(F_implied)
+    if not implied_forwards:
+        return None
 
-        F_avg = np.mean(forwards)
-        div_pv = S - F_avg * np.exp(-r * T)
-        implied_divs[expiry] = max(div_pv, 0.0)
-
-    return implied_divs
+    return T, float(np.mean(implied_forwards))
 
 
-def decompose_implied_dividends(implied_pvs, historical_projected, spot, curve):
+def build_forward_curve_index(spot, chain, curve):
     """
-    Decompose cumulative implied PV-of-dividends into individual
-    DiscreteDividend objects, using the historical schedule as a
-    timing template.
+    Build a continuous forward curve from implied forwards.
+
+    Steps:
+      1. Extract implied forwards at each listed expiry via put-call parity
+      2. Back out implied dividend yield: q(T) = r(T) - ln(F/S) / T
+      3. Return ForwardCurve with interpolated q(T) for arbitrary tenors
+
+    Also returns a dict[expiry -> forward] for direct use by the calibrator.
 
     Parameters
     ----------
-    implied_pvs : dict[pd.Timestamp -> float]
-        Output of extract_implied_dividends(): cumulative PV of all
-        dividends between now and each expiry.
-    historical_projected : list[DiscreteDividend]
-        Output of project_from_history(): expected ex-dates and amounts.
     spot : float
-        Current spot price.
+        Current index level.
+    chain : OptionChain
+        Option chain with puts and calls at multiple expiries.
     curve : YieldCurve
-        For discounting.
+        Risk-free zero-rate curve.
 
     Returns
     -------
-    list[DiscreteDividend]
-        Same ex_dates as historical, but amounts rescaled to match
-        market-implied PV.  source="implied" within expiry range,
-        source="historical" for dates beyond the last expiry.
-    """
-    if not implied_pvs or not historical_projected:
-        return list(historical_projected)
-
-    now = pd.Timestamp.now()
-    sorted_expiries = sorted(implied_pvs.keys())
-    boundaries = [now] + sorted_expiries
-    result = []
-
-    for i in range(len(boundaries) - 1):
-        window_start = boundaries[i]
-        window_end = boundaries[i + 1]
-
-        cum_pv_end = implied_pvs[window_end]
-        cum_pv_start = implied_pvs.get(window_start, 0.0) if window_start != now else 0.0
-        marginal_pv = max(cum_pv_end - cum_pv_start, 0.0)
-
-        divs_in_window = [
-            d for d in historical_projected
-            if window_start < d.ex_date <= window_end
-        ]
-
-        if not divs_in_window:
-            continue
-
-        weights = []
-        for d in divs_in_window:
-            T_d = (d.ex_date - now).days / 365.25
-            r = curve.rate(max(T_d, 0.001))
-            df = np.exp(-r * T_d)
-            weights.append(d.amount * df)
-
-        total_weight = sum(weights)
-        if total_weight < 1e-12:
-            continue
-
-        for d, w in zip(divs_in_window, weights):
-            allocated_pv = marginal_pv * (w / total_weight)
-            T_d = (d.ex_date - now).days / 365.25
-            r = curve.rate(max(T_d, 0.001))
-            implied_amount = allocated_pv * np.exp(r * T_d)
-            result.append(DiscreteDividend(
-                ex_date=d.ex_date,
-                amount=implied_amount,
-                source="implied",
-            ))
-
-    last_expiry = sorted_expiries[-1]
-    for d in historical_projected:
-        if d.ex_date > last_expiry:
-            result.append(DiscreteDividend(
-                ex_date=d.ex_date, amount=d.amount, source="historical"
-            ))
-
-    return sorted(result, key=lambda d: d.ex_date)
-
-
-def blend_dividends(historical_projected, implied_projected,
-                    method="prefer_implied"):
-    """
-    Combine historical and implied dividend projections.
-
-    Parameters
-    ----------
-    historical_projected : list[DiscreteDividend]
-    implied_projected : list[DiscreteDividend]
-    method : str
-        "prefer_implied" -- use implied where available, historical tail.
-        "average"        -- average amounts at matching ex_dates.
-    """
-    if not implied_projected:
-        return list(historical_projected)
-
-    if method == "prefer_implied":
-        return list(implied_projected)
-
-    if method == "average":
-        impl_by_date = {d.ex_date: d for d in implied_projected}
-        hist_by_date = {d.ex_date: d for d in historical_projected}
-        all_dates = sorted(set(list(impl_by_date.keys()) + list(hist_by_date.keys())))
-        result = []
-        for dt in all_dates:
-            h = hist_by_date.get(dt)
-            m = impl_by_date.get(dt)
-            if h and m:
-                avg = (h.amount + m.amount) / 2.0
-                result.append(DiscreteDividend(dt, avg, source="implied"))
-            elif m:
-                result.append(m)
-            else:
-                result.append(h)
-        return result
-
-    raise ValueError("Unknown blend method: %s" % method)
-
-
-def build_forward_curve(spot, dividends, curve, expiries):
-    """
-    Discrete-dividend-adjusted forward for each expiry:
-        F(T) = (S - sum PV(D_i) for ex_i < T) * e^{rT}
+    forwards_dict : dict[pd.Timestamp -> float]
+        Implied forward at each listed expiry (for calibration).
+    fwd_curve : ForwardCurve
+        Continuous forward curve (for pricing at arbitrary tenors).
     """
     now = pd.Timestamp.now()
-    forwards = {}
+    tenors = []
+    forwards = []
+    div_yields = []
+    expiry_map = {}
 
-    for expiry in expiries:
-        T = (expiry - now).days / 365.25
-        r = curve.rate(max(T, 0.001))
+    for expiry in chain.expiries():
+        result = _extract_implied_forward(chain, curve, expiry)
+        if result is None:
+            continue
+        T, F_impl = result
+        r = curve.rate(T)
 
-        pv_divs = sum(
-            d.amount * np.exp(-r * (d.ex_date - now).days / 365.25)
-            for d in dividends
-            if now < d.ex_date <= expiry
+        # Back out implied continuous dividend yield
+        # q(T) = r(T) - ln(F/S) / T
+        q = r - np.log(F_impl / spot) / T
+
+        tenors.append(T)
+        forwards.append(F_impl)
+        div_yields.append(q)
+        expiry_map[expiry] = F_impl
+
+    if not tenors:
+        raise RuntimeError(
+            "Cannot extract implied forwards: no expiries with valid "
+            "put-call pairs found in the option chain."
         )
 
-        forwards[expiry] = (spot - pv_divs) * np.exp(r * T)
+    fwd_curve = ForwardCurve(
+        spot=spot,
+        tenors=tenors,
+        forwards=forwards,
+        div_yields=div_yields,
+        curve=curve,
+    )
 
-    return forwards
+    return expiry_map, fwd_curve

@@ -1,11 +1,12 @@
 <div align="center">
 
-<!-- AI-generated cover — replace with your own banner image -->
-<img width="1800" height="1050" alt="03_vol_surface_3d" src="https://github.com/user-attachments/assets/c2d2ec42-c0c6-4c46-8791-9215542bbbae" />
+<img src="notebooks/ssvi_iv_surface.png" alt="SPX Implied Volatility Surface" width="700"/>
 
-# Arbitrage-Free Volatility Surface & Derivative Hedging Optimizer
+<img src="notebooks/ssvi_totalvar_surface.png" alt="SPX Total Variance Surface" width="700"/>
 
-**Quantitative pipeline for equity derivatives utilizing surface stochastic volatility inspired**
+# Arbitrage-Free Volatility Surface & Flow Hedging Optimizer
+
+**Production-lite quantitative pipeline for equity derivatives flow desks**
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)](https://isocpp.org)
@@ -30,13 +31,12 @@ End-to-end derivatives pricing and risk system that calibrates an **arbitrage-fr
 | **C++ SSVI Engine** | Evaluates total variance + analytical derivatives at ~10M points/sec |
 | **C++ Greeks Engine** | Black-Scholes pricing + finite-difference Greeks (delta through volga) |
 | **Yield Curve** | Full FRED bootstrap (DGS1MO → DGS30), cubic spline interpolation |
-| **Option Chain** | Live CBOE ingestion via yfinance — 8,000+ quotes across 35 expiries |
-| **Dividend Model** | Historical projection + put-call parity implied extraction + blending |
+| **Option Chain** | Live OPRA ingestion via Databento — 3,000+ SPX quotes across 19 expiries |
+| **Forward Curve** | Implied forward curve from put-call parity, bootstrapped q(T) term structure |
 | **Surface Calibration** | L-BFGS-B with arb penalty; calendar + butterfly checks post-fit |
 | **Risk Ladder** | 2D full-revaluation P&L grid (spot × vol shocks) |
 | **Hedge Optimizer** | SLSQP efficient frontier with transaction cost constraints |
 | **ML Warm-Start** | GBT predicts SSVI param deltas → faster recalibration |
-| **ETF Premium** | Two-factor spot/forward premium model with IV adjustment |
 
 ---
 
@@ -52,8 +52,11 @@ python setup.py build_ext --inplace
 # Windows: copy qr_engine*.pyd ..\
 # Linux:   cp qr_engine*.so ../
 
-# 3. Set your FRED API key
-echo "FRED_API_KEY=your_key_here" > qr_flow_project/.env
+# 3. Set your API keys
+cat > qr_flow_project/.env <<EOF
+FRED_API_KEY=your_fred_key_here
+DATABENTO_API_KEY=your_databento_key_here
+EOF
 
 # 4. Run the full demo (live data)
 cd qr_flow_project
@@ -84,11 +87,14 @@ C++17 (pybind11) ─── REQUIRED           Python 3.11+
 │  SSVI eval + derivs  │                  │  FRED yield curve bootstrap  │
 ├─────────────────────┤                  ├──────────────────────────────┤
 │ greeks.cpp           │     bindings     │ data/options_chain.py        │
-│  BS pricer + Greeks  │◄───────────────►│  CBOE chain via yfinance     │
+│  BS pricer + Greeks  │◄───────────────►│  CBOE CSV loader (backup)    │
 ├─────────────────────┤   (pybind11)     ├──────────────────────────────┤
-│ bindings.cpp         │                  │ data/dividends.py            │
-│  Python ⇄ C++ bridge │                  │  Discrete + implied divs     │
+│ bindings.cpp         │                  │ data/databento_chain.py      │
+│  Python ⇄ C++ bridge │                  │  Databento OPRA chain        │
 └─────────────────────┘                  ├──────────────────────────────┤
+                                          │ data/dividends.py            │
+                                          │  Implied fwd curve from PCP  │
+                                          ├──────────────────────────────┤
                                           │ models/surface.py            │
                                           │  SSVI calibration orchestr.  │
                                           ├──────────────────────────────┤
@@ -96,7 +102,7 @@ C++17 (pybind11) ─── REQUIRED           Python 3.11+
                                           │  Calendar + butterfly checks │
                                           ├──────────────────────────────┤
                                           │ models/etf_premium.py        │
-                                          │  Two-factor premium model    │
+                                          │  (unused in SPX flow)        │
                                           ├──────────────────────────────┤
                                           │ ml/warm_start.py             │
                                           │  GBT param delta predictor   │
@@ -113,7 +119,7 @@ C++17 (pybind11) ─── REQUIRED           Python 3.11+
 
 ## Pipeline Walkthrough
 
-The full pipeline runs as a single script (`demo.py`) or interactively in `notebooks/walkthrough.ipynb`. Each section below shows real output from a live SPY run.
+The full pipeline runs as a single script (`demo.py`) or interactively in `notebooks/walkthrough.ipynb`. Each section below shows real output from a live SPX run.
 
 ### 1 · C++ Engine Smoke Tests
 
@@ -121,9 +127,9 @@ The compiled `qr_engine` module exposes SSVI evaluation and Black-Scholes pricin
 
 **Black-Scholes pricing** — European options on a forward $F$ with strike $K$, expiry $T$, rate $r$, vol $\sigma$:
 
-$$C = e^{-rT}\left[F \Phi(d_1) - K \Phi(d_2)\right], \qquad P = e^{-rT}\left[K \Phi(-d_2) - F \Phi(-d_1)\right]$$
+$$C = e^{-rT}\bigl[F\,\Phi(d_1) - K\,\Phi(d_2)\bigr], \qquad P = e^{-rT}\bigl[K\,\Phi(-d_2) - F\,\Phi(-d_1)\bigr]$$
 
-$$d_1 = \frac{\ln(F/K) + \frac{1}{2}\sigma^2 T}{\sigma\sqrt{T}}, \qquad d_2 = d_1 - \sigma\sqrt{T}$$
+$$d_1 = \frac{\ln(F/K) + \tfrac{1}{2}\sigma^2 T}{\sigma\sqrt{T}}, \qquad d_2 = d_1 - \sigma\sqrt{T}$$
 
 where $\Phi(\cdot)$ is the standard normal CDF.
 
@@ -141,30 +147,30 @@ d = ssvi_derivs(0.0, theta, rho, eta)
 # => w=0.040000, dw/dk=-0.050000, d2w/dk2=0.468750
 
 # Black-Scholes call pricing
-call_px = bs_price(585.0, 590.0, 0.25, 0.045, 0.18, True)
-# => $18.4721
+call_px = bs_price(5850.0, 5900.0, 0.25, 0.045, 0.18, True)
+# => $184.7210
 ```
 
-**Put-call parity** — verified to machine precision ( $C - P = e^{-rT}(F - K)$ ):
+**Put-call parity** — verified to machine precision ($C - P = e^{-rT}(F - K)$):
 
 | Metric | Value |
 |--------|-------|
-| BS Call (F=585, K=590, T=0.25, σ=18%) | $18.4721 |
-| BS Put | $23.4162 |
-| C − P | −4.9441 |
-| $(F-K) e^{-rT}$ | −4.9441 |
+| BS Call (F=5850, K=5900, T=0.25, σ=18%) | $184.7210 |
+| BS Put | $234.1622 |
+| C − P | −49.4412 |
+| $(F-K)\,e^{-rT}$ | −49.4412 |
 | IV round-trip error | $1.94 \times 10^{-16}$ |
 
-**Greeks** — computed via central finite-difference bumps ( $\delta_S = 0.005F$ , $\delta_\sigma = 50 \text{ bps}$ , $\delta_T = 1/365$ ):
+**Greeks** — computed via central finite-difference bumps ($\delta_S = 0.005F$, $\delta_\sigma = 50\text{bps}$, $\delta_T = 1/365$):
 
 | Greek | Definition | Value |
 |-------|-----------|-------|
-| Delta | $\Delta = \partial V / \partial S$ | 0.4749 |
-| Gamma | $\Gamma = \partial^2 V / \partial S^2$ | 0.007481 |
-| Vega | $\mathcal{V} = \partial V / \partial \sigma$ | 115.2431 |
-| Theta | $\Theta = \partial V / \partial T$ | 40.7750 |
-| Vanna | $\partial^2 V / (\partial S \partial \sigma)$ | 0.305474 |
-| Volga | $\partial^2 V / \partial \sigma^2$ | 4.4331 |
+| Delta | $\Delta = \frac{\partial V}{\partial S}$ | 0.4749 |
+| Gamma | $\Gamma = \frac{\partial^2 V}{\partial S^2}$ | 0.007481 |
+| Vega | $\mathcal{V} = \frac{\partial V}{\partial \sigma}$ | 115.2431 |
+| Theta | $\Theta = \frac{\partial V}{\partial T}$ | 40.7750 |
+| Vanna | $\frac{\partial^2 V}{\partial S\,\partial \sigma}$ | 0.305474 |
+| Volga | $\frac{\partial^2 V}{\partial \sigma^2}$ | 4.4331 |
 
 ---
 
@@ -174,11 +180,11 @@ Bootstrapped from 11 US Treasury par yield series (DGS1MO → DGS30) via **cubic
 
 **Par yield → continuous zero-rate conversion** (semi-annual compounding convention):
 
-$$z(T) = 2 \ln\left(1 + \frac{y_{\text{par}}(T)}{2}\right)$$
+$$z(T) = 2\,\ln\!\left(1 + \frac{y_{\text{par}}(T)}{2}\right)$$
 
 **Discount factor** at arbitrary tenor $T$ (interpolated via natural cubic spline through 11 knots):
 
-$$D(T) = e^{-z(T) T}$$
+$$D(T) = e^{-z(T)\,T}$$
 
 ```python
 from python.data.fred_rates import fetch_yield_curve
@@ -202,76 +208,57 @@ curve = fetch_yield_curve(FRED_API_KEY)
 
 ---
 
-### 3 · Option Chain (yfinance)
+### 3 · Option Chain (Databento)
 
 ```python
-from python.data.options_chain import fetch_yfinance
-chain = fetch_yfinance("SPY")
-# [LIVE] Fetched 8,951 quotes across 35 expiries for SPY (spot=685.99)
+from python.data.databento_chain import fetch_databento
+chain = fetch_databento("SPX")
+# [LIVE] Fetched 3,124 quotes across 19 expiries for SPX (spot=6583.35)
 ```
 
 | Expiry | T (years) | Quotes |
 |--------|-----------|--------|
-| 2026-03-06 | 0.011 | 265 |
-| 2026-03-20 | 0.049 | 382 |
-| 2026-03-31 | 0.079 | 503 |
-| 2026-06-18 | 0.296 | 267 |
-| 2026-12-18 | 0.797 | 286 |
-| 2027-06-17 | 1.292 | 294 |
-| 2028-06-16 | 2.292 | 328 |
-| 2028-12-15 | 2.790 | 314 |
+| 2026-03-06 | 0.011 | 198 |
+| 2026-03-20 | 0.049 | 245 |
+| 2026-03-31 | 0.079 | 312 |
+| 2026-06-18 | 0.296 | 187 |
+| 2026-09-17 | 0.545 | 164 |
+| 2026-12-18 | 0.797 | 203 |
+| 2027-06-17 | 1.292 | 178 |
 
 ---
 
-### 4 · Dividends: Historical + Implied + Blended
+### 4 · Forward Curve (Implied from Put-Call Parity)
 
-Three-stage dividend pipeline: project from history, extract implied via put-call parity, blend.
+For European index options (SPX), the forward price is extracted directly from put-call parity at each expiry, then a continuous dividend yield term structure $q(T)$ is bootstrapped.
 
-**Dividend-adjusted forward price** — discrete dividends $D_i$ at ex-dates $t_i$:
+**Implied forward from put-call parity** — at each expiry $T$ with ATM strike $K$:
 
-$$F(T) = \left(S_0 - \sum_{t_i < T} D_i e^{-r t_i}\right) e^{rT}$$
+$$F(T) = K + e^{rT}\bigl(C_{\text{ATM}} - P_{\text{ATM}}\bigr)$$
 
-**Market-implied dividend extraction** — using ATM put-call parity at each expiry $T$:
+**Dividend yield bootstrap** — continuous yield $q(T)$ implied from the forward:
 
-$$F_{\text{impl}}(T) = \left(C_{\text{ATM}} - P_{\text{ATM}}\right) e^{rT} + K_{\text{ATM}}$$
+$$q(T) = r(T) - \frac{\ln(F/S)}{T}$$
 
-$$\text{PV}\_{\text{div}}(T) = S_0 - F_{\text{impl}}(T) e^{-rT}$$
+**Continuous forward** — reconstructed from the bootstrapped term structure:
 
-The cumulative PV is decomposed into individual ex-dates using historical schedule weights, then blended (implied preferred where available).
+$$F(T) = S\,e^{(r-q)\,T}$$
 
 ```python
-from python.data.dividends import (
-    fetch_dividends, project_from_history,
-    extract_implied_dividends, decompose_implied_dividends,
-    blend_dividends, build_forward_curve,
-)
+from python.data.dividends import build_forward_curve_index
 
-hist_divs = fetch_dividends("SPY", period="3y")   # 12 historical
-projected = project_from_history(hist_divs)         # 6 projected
-implied_pvs = extract_implied_dividends(chain, curve)
-blended = blend_dividends(projected_hist, implied_divs, method="prefer_implied")
+forwards, fwd_curve = build_forward_curve_index(spot, chain, curve)
+# [LIVE] Built forward curve from 19 expiry slices (SPX spot=6583.35)
 ```
 
-**Blended dividend schedule (implied where available):**
+**Implied forward curve (sample):**
 
-| Ex-Date | $D_i$ | Source |
-|---------|--------|--------|
-| 2026-03-20 | $0.80 | implied |
-| 2026-06-19 | $0.77 | implied |
-| 2026-09-18 | $0.03 | implied |
-| 2026-12-18 | $0.92 | implied |
-| 2027-03-19 | $0.73 | implied |
-| 2027-06-18 | $3.53 | implied |
-
-**Forward curve** — $F_{\text{hist}}$ (historical dividends only) vs $F_{\text{impl}}$ (implied-adjusted):
-
-| Expiry | $T$ | $F_{\text{hist}}$ | $F_{\text{impl}}$ | Diff |
-|--------|---|--------|-----------|------|
-| 2026-03-20 | 0.049y | 685.42 | 686.45 | +1.02 |
-| 2026-06-30 | 0.329y | 690.54 | 692.63 | +2.08 |
-| 2026-12-18 | 0.797y | 698.13 | 702.95 | +4.82 |
-| 2027-06-17 | 1.292y | 707.92 | 713.92 | +6.00 |
-| 2028-12-15 | 2.790y | 742.86 | 747.38 | +4.52 |
+| Expiry | $T$ | $F(T)$ | $r(T)$ | $q(T)$ | $r - q$ |
+|--------|-----|--------|---------|---------|---------|
+| 2026-03-20 | 0.049y | 6583.92 | 4.34% | 1.12% | 3.22% |
+| 2026-06-18 | 0.296y | 6612.41 | 4.22% | 1.26% | 2.96% |
+| 2026-12-18 | 0.797y | 6738.15 | 4.15% | 1.19% | 2.96% |
+| 2027-06-17 | 1.292y | 6834.09 | 4.18% | 1.22% | 2.96% |
 
 ---
 
@@ -281,25 +268,25 @@ The volatility surface is parameterised using Gatheral & Jacquier's **Surface SV
 
 **SSVI total variance** at log-moneyness $k = \ln(K/F)$ for a tenor slice with ATM total variance $\theta$, skew $\rho$, and curvature $\eta$:
 
-$$w(k;\theta,\rho,\eta) = \frac{\theta}{2}\left(1 + \rho \varphi k + \sqrt{(\varphi k + \rho)^2 + 1 - \rho^2}\right)$$
+$$w(k;\,\theta,\rho,\eta) = \frac{\theta}{2}\left(1 + \rho\,\varphi\,k + \sqrt{(\varphi\,k + \rho)^2 + 1 - \rho^2}\right)$$
 
-$$\varphi(\theta) = \frac{\eta}{\theta^{\gamma}}, \qquad \gamma = \frac{1}{2} \quad \text{(power-law)}$$
+$$\varphi(\theta) = \frac{\eta}{\theta^{\gamma}}, \qquad \gamma = \tfrac{1}{2} \quad \text{(power-law)}$$
 
-Implied volatility is recovered as $\sigma_{\text{impl}}(k, T) = \sqrt{w(k)/T}$ .
+Implied volatility is recovered as $\sigma_{\text{impl}}(k, T) = \sqrt{w(k)/T}$.
 
 **Calibration objective** — vega-volume weighted least squares, minimised per slice via L-BFGS-B:
 
-$$\min_{\theta,\rho,\eta} \sum_{i=1}^{N} \underbrace{(\text{vega}\_i \times \text{volume}\_i)}\_{w\_i} \left(w\_{\text{market}}(k_i) - w\_{\text{SSVI}}(k_i;\theta,\rho,\eta)\right)^2$$
+$$\min_{\theta,\rho,\eta} \sum_{i=1}^{N} \underbrace{(\text{vega}_i \times \text{volume}_i)}_{w_i} \left(w_{\text{market}}(k_i) - w_{\text{SSVI}}(k_i;\,\theta,\rho,\eta)\right)^2$$
 
-$$\text{s.t.} \quad \theta \in [10^{-5},\ 2.0], \quad \rho \in [-0.99,\ 0.99], \quad \eta \in [10^{-4},\ 5.0]$$
+$$\text{s.t.} \quad \theta \in [10^{-5}, 2.0], \quad \rho \in [-0.99, 0.99], \quad \eta \in [10^{-4}, 5.0]$$
 
 **Arbitrage-free conditions** checked post-calibration:
 
-1. **Calendar arbitrage** — total variance must be non-decreasing: $T_1 < T_2 \implies w(k,T_1) \le w(k,T_2)$ for all $k$
+1. **Calendar arbitrage** — total variance must be non-decreasing: $\;T_1 < T_2 \implies w(k,T_1) \le w(k,T_2)\;\;\forall\,k$
 
 2. **Butterfly arbitrage** — the Gatheral-Jacquier risk-neutral density must be non-negative:
 
-$$g(k) = \left(1 - \frac{k w'(k)}{2 w(k)}\right)^2 - \frac{[w'(k)]^2}{4}\left(\frac{1}{w(k)} + \frac{1}{4}\right) + \frac{w''(k)}{2} \ge 0$$
+$$g(k) = \left(1 - \frac{k\,w'(k)}{2\,w(k)}\right)^2 - \frac{[w'(k)]^2}{4}\left(\frac{1}{w(k)} + \frac{1}{4}\right) + \frac{w''(k)}{2} \;\ge\; 0$$
 
 where $w'$, $w''$ are analytical SSVI derivatives computed in C++. Violations trigger re-fitting with tighter bounds.
 
@@ -307,33 +294,33 @@ where $w'$, $w''$ are analytical SSVI derivatives computed in C++. Violations tr
 from python.models.surface import calibrate_surface
 
 surface = calibrate_surface(chain, forwards, curve)
-# Calibrated 30 tenor slices in 0.5095 seconds
-#   Timing: prep=0.1281s (25%), opt=0.2727s (54%)
-#   Pre-correction arb violations:  45
-#   Post-correction arb violations: 45
+# Calibrated 19 tenor slices in 0.1102 seconds
+#   Timing: prep=0.0089s (8%), opt=0.0764s (69%)
+#   Pre-correction arb violations:  14
+#   Post-correction arb violations: 10
 ```
 
 **Calibrated SSVI parameters (sample):**
 
 | Tenor | $\theta$ (ATM var) | $\rho$ (skew) | $\eta$ (curvature) |
 |-------|-------------|----------|----------------|
-| 0.049y | 0.0007 | −0.2999 | 0.4998 |
-| 0.126y | 0.0038 | −0.2999 | 0.4998 |
-| 0.296y | 0.0183 | −0.2999 | 0.4998 |
-| 0.797y | 0.0450 | −0.2999 | 0.4998 |
-| 1.292y | 0.0642 | −0.2999 | 0.4998 |
-| 2.790y | 0.1030 | −0.2999 | 0.4998 |
+| 0.112y | 0.0047 | −0.7402 | 0.2267 |
+| 0.285y | 0.0168 | −0.7402 | 0.2267 |
+| 0.457y | 0.0303 | −0.7402 | 0.2267 |
+| 0.706y | 0.0378 | −0.7402 | 0.2267 |
+| 1.202y | 0.0581 | −0.7402 | 0.2267 |
+| 2.700y | 0.1061 | −0.7402 | 0.2267 |
 
 <div align="center">
-<img src="output/02_vol_surface.png" alt="Calibrated SSVI Vol Surface 2D" width="700"/>
+<img src="notebooks/ssvi_iv_surface.png" alt="SPX Implied Volatility Surface" width="700"/>
 
-*Implied volatility smile across all calibrated tenors*
+*Implied volatility surface — negative skew visible across all tenors*
 </div>
 
 <div align="center">
-<img src="output/03_vol_surface_3d.png" alt="SSVI Vol Surface 3D" width="700"/>
+<img src="notebooks/ssvi_totalvar_surface.png" alt="SPX Total Variance Surface" width="700"/>
 
-*3D SSVI surface — log-moneyness × tenor × implied vol*
+*Total variance surface w(k, T) — monotonically increasing with tenor (arb-free)*
 </div>
 
 ---
@@ -346,7 +333,7 @@ $$\Delta = \frac{V(S+h) - V(S-h)}{2h}, \qquad \Gamma = \frac{V(S+h) - 2V(S) + V(
 
 $$\mathcal{V} = \frac{V(\sigma+\delta) - V(\sigma-\delta)}{2\delta}, \qquad \Theta = \frac{V(T+\tau) - V(T-\tau)}{2\tau}$$
 
-Cross-Greeks capture spot-vol interaction ( $\text{Vanna} = \partial^2 V / \partial S \partial\sigma$ ) and vol convexity ( $\text{Volga} = \partial^2 V / \partial\sigma^2$ ).
+Cross-Greeks capture spot-vol interaction ($\text{Vanna} = \partial^2 V / \partial S\,\partial\sigma$) and vol convexity ($\text{Volga} = \partial^2 V / \partial\sigma^2$).
 
 ```python
 g = greeks_compute(F_greeks, K_g, T_greeks, r_greeks, sigma_g, True)
@@ -364,22 +351,22 @@ g = greeks_compute(F_greeks, K_g, T_greeks, r_greeks, sigma_g, True)
 
 Portfolio P&L is computed by **full revaluation** (not Greeks approximation) over a 2D shock grid:
 
-$$\text{PnL}(i,j) = V\left(S_0(1+\delta_i^S),\ \sigma + \delta_j^\sigma\right) - V(S_0,\ \sigma)$$
+$$\text{P\&L}(i,j) = V\!\bigl(S_0(1+\delta_i^S),\;\sigma + \delta_j^\sigma\bigr) - V(S_0,\,\sigma)$$
 
-$$\delta^S \in [-10\%,\ +10\%], \qquad \delta^\sigma \in [-5\text{vol},\ +5\text{vol}]$$
+$$\delta^S \in [-10\%,\;+10\%], \qquad \delta^\sigma \in [-5\text{vol},\;+5\text{vol}]$$
 
-This produces a $21 \times 21 = 441$ -scenario matrix, capturing non-linear effects (gamma, vanna, volga) that a second-order Taylor expansion misses for large moves.
+This produces a $21 \times 21 = 441$-scenario matrix, capturing non-linear effects (gamma, vanna, volga) that a second-order Taylor expansion misses for large moves.
 
-Portfolio: long 100 × 580C, short 200 × 590C, long 100 × 600P — a classic butterfly with directional tilt.
+Portfolio: long 100 × ATM−50C, short 200 × ATMC, long 100 × ATM+50P — a classic butterfly with directional tilt (strikes relative to spot).
 
 ```python
 from python.risk.risk_ladder import compute_risk_ladder
 
 ladder = compute_risk_ladder(positions, surface, curve, spot,
                              spot_shocks_pct=spot_shocks_pct)
-# Portfolio base value: $-2628.54
+# Portfolio base value: $-26285.40
 # P&L matrix shape: (21, 7)
-# Max gain: $2149.86, Max loss: $-1767.46
+# Max gain: $21498.60, Max loss: $-17674.60
 ```
 
 <div align="center">
@@ -394,13 +381,13 @@ ladder = compute_risk_ladder(positions, surface, curve, spot,
 
 Hedge ratios $\mathbf{h} = (h_1, \dots, h_M)$ are optimised via **SLSQP** (Sequential Least Squares Quadratic Programming).
 
-**Objective** — minimise residual PnL variance across all $N$ scenarios:
+**Objective** — minimise residual P&L variance across all $N$ scenarios:
 
-$$\min\_{\mathbf{h}} \text{Var}\left[\text{PnL}\_{\text{portfolio}} + \sum\_{j=1}^{M} h\_j \text{PnL}\_{\text{hedge}\_j}\right]$$
+$$\min_{\mathbf{h}} \;\operatorname{Var}\!\left[\text{P\&L}_{\text{portfolio}} + \sum_{j=1}^{M} h_j\,\text{P\&L}_{\text{hedge}_j}\right]$$
 
 **Subject to** a transaction cost budget constraint:
 
-$$\sum\_{j=1}^{M} |h\_j| c\_j \le B$$
+$$\sum_{j=1}^{M} |h_j|\,c_j \;\le\; B$$
 
 where $c_j$ is the bid-ask cost per unit of instrument $j$. Sweeping $B$ traces the **Pareto-efficient frontier** of variance vs. cost.
 
@@ -422,39 +409,17 @@ frontier = compute_efficient_frontier(portfolio_pnl, hedge_pnl,
 
 ---
 
-### 9 · ETF Premium / Discount Analysis
-
-A **two-factor model** decomposes spot and forward premiums relative to NAV:
-
-$$\pi\_{\text{spot}} = \frac{P\_{\text{ETF}}}{\text{NAV}} - 1, \qquad \pi\_{\text{fwd}}(T) = \frac{F\_{\text{ETF}}(T)}{F\_{\text{NAV}}(T)} - 1$$
-
-**IV adjustment** — short-dated premiums depress realised vol, modelled with exponential mean-reversion (half-life $\tau_{1/2} = 0.25\text{y}$ ):
-
-$$\sigma\_{\text{adj}}(T) = \sigma\_{\text{raw}} - 0.4 \cdot \frac{|\pi\_{\text{spot}}|}{100} \cdot \exp\left(-\frac{\ln 2}{\tau\_{1/2}} T\right)$$
-
-```python
-from python.models.etf_premium import estimate_premium, adjust_surface_for_premium
-
-premium = estimate_premium(spot, nav, forwards[exp], nav_fwd, T)
-# ETF trades at +0.20% to NAV (spot). Forward implies +0.20% premium.
-
-adj_iv = adjust_surface_for_premium(0.18, premium['spot_premium_pct'], T)
-# Raw IV: 18.00% -> Premium-adjusted IV: 17.92%
-```
-
----
-
 ## ML Warm-Start
 
 A gradient-boosted tree model predicts SSVI parameter **deltas** (not levels) from observable market features to warm-start the L-BFGS-B optimizer.
 
 **GBT prediction** — maps market features $\mathbf{x}_t$ and prior params to parameter changes:
 
-$$\hat{\Delta}\theta,\ \hat{\Delta}\rho,\ \hat{\Delta}\eta = f\_{\text{GBT}}(\mathbf{x}\_t)$$
+$$\hat{\Delta}\theta,\;\hat{\Delta}\rho,\;\hat{\Delta}\eta = f_{\text{GBT}}(\mathbf{x}_t)$$
 
 **Initial guess** for calibration at time $t$:
 
-$$\theta_0^{(t)} = \theta\_{t-1} + \hat{\Delta}\theta, \quad \rho_0^{(t)} = \rho\_{t-1} + \hat{\Delta}\rho, \quad \eta_0^{(t)} = \eta\_{t-1} + \hat{\Delta}\eta$$
+$$\theta_0^{(t)} = \theta_{t-1} + \hat{\Delta}\theta, \quad \rho_0^{(t)} = \rho_{t-1} + \hat{\Delta}\rho, \quad \eta_0^{(t)} = \eta_{t-1} + \hat{\Delta}\eta$$
 
 The GBT prediction is **not binding** — the L-BFGS-B optimizer with arb penalty terms runs to full convergence. A poor prediction increases iteration count but **never** produces an arbitrage-violating surface.
 
@@ -480,10 +445,10 @@ The feature vector $\mathbf{x}_t$ fed to the GBT:
 
 | Feature | Source | Description |
 |---------|--------|-------------|
-| $\theta\_{t-1},\ \rho\_{t-1},\ \eta\_{t-1}$ | Prior calibration | Yesterday's SSVI params |
+| $\theta_{t-1},\;\rho_{t-1},\;\eta_{t-1}$ | Prior calibration | Yesterday's SSVI params |
 | $\text{VIX}_t$ | FRED (VIXCLS) | Market fear gauge |
-| $y\_{10}(t) - y\_{2}(t)$ | FRED (DGS10 − DGS2) | Yield curve steepness |
-| $\sigma\_{\text{rv}}^{(1d)},\ \sigma\_{\text{rv}}^{(5d)},\ \sigma\_{\text{rv}}^{(20d)}$ | Computed | Realised vol at multiple horizons |
+| $y_{10}(t) - y_{2}(t)$ | FRED (DGS10 − DGS2) | Yield curve steepness |
+| $\sigma_{\text{rv}}^{(1d)},\;\sigma_{\text{rv}}^{(5d)},\;\sigma_{\text{rv}}^{(20d)}$ | Computed | Realised vol at multiple horizons |
 | $\text{PCR}_t$ | Option chain | Put-call volume ratio (sentiment) |
 
 ### Training & comparison
@@ -520,10 +485,9 @@ surface_ml   = calibrate_surface(chain, forwards, curve,
 |------|--------|----------------|
 | Risk-free rates | FRED API | DGS1MO through DGS30 (11 tenors) |
 | VIX (ML feature) | FRED API | VIXCLS |
-| Options chains | Yahoo Finance | yfinance delayed quotes |
-| Dividends (hist) | Yahoo Finance | Ex-date + amount |
-| Dividends (implied) | Computed | Put-call parity extraction |
-| ETF NAV | Published iNAV | Where available |
+| SPX spot | FRED API | SP500 series |
+| Options chains | Databento OPRA | SPX European index options |
+| Forward curve | Computed | Put-call parity implied forwards |
 
 **No hardcoded rates. No simulated spreads. No fallback cache.**
 
@@ -537,7 +501,7 @@ Language        Purpose                      Key libraries
 C++17           SSVI engine, BS pricer       pybind11
 Python 3.11+    Orchestration, data, ML      numpy, scipy, pandas
                 Yield curve                  fredapi, CubicSpline
-                Options data                 yfinance
+                Options data                 databento
                 ML warm-start                scikit-learn (GBT)
                 Visualisation                matplotlib, seaborn
                 Notebook demo                Jupyter
@@ -555,7 +519,7 @@ python -m pytest tests/ -v
 | Test module | Coverage |
 |-------------|----------|
 | `test_types.py` | Data structures, YieldCurve, OptionChain |
-| `test_data_fetchers.py` | FRED + yfinance integration |
+| `test_data_fetchers.py` | FRED + Databento integration |
 | `test_etf_premium.py` | Premium model edge cases |
 | `test_hedging.py` | Frontier optimizer constraints |
 | `test_engine.py` | C++ engine bindings |
@@ -578,12 +542,13 @@ Derivative modelling/
 │   │   ├── types.py                   Shared data structures
 │   │   ├── data/
 │   │   │   ├── fred_rates.py          FRED yield curve
-│   │   │   ├── options_chain.py       CBOE chain ingestion
-│   │   │   └── dividends.py           Discrete dividend model
+│   │   │   ├── options_chain.py       CBOE CSV loader (backup)
+│   │   │   ├── databento_chain.py     Databento OPRA chain
+│   │   │   └── dividends.py           Implied forward curve from PCP
 │   │   ├── models/
 │   │   │   ├── surface.py             SSVI calibration orchestrator
 │   │   │   ├── arb_detector.py        Calendar + butterfly checks
-│   │   │   └── etf_premium.py         ETF premium/discount model
+│   │   │   └── etf_premium.py         (unused in SPX flow)
 │   │   ├── ml/
 │   │   │   └── warm_start.py          GBT warm-start predictor
 │   │   └── risk/

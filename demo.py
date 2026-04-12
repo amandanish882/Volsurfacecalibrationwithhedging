@@ -5,10 +5,10 @@ demo.py
 Full project demonstration using live market data.
 
 Data sources:
-    - Yield curve: FRED API (requires FRED_API_KEY in .env or environment)
-    - Option chain: Yahoo Finance via yfinance
-    - Dividends:    Yahoo Finance via yfinance
-    - ML features:  Derived from FRED + option chain
+    - Yield curve:    FRED API (requires FRED_API_KEY in .env or environment)
+    - Option chain:   Databento OPRA (requires DATABENTO_API_KEY in .env or environment)
+    - Forward curve:  Implied from put-call parity, F(T) = S * exp((r-q)*T)
+    - ML features:    Derived from FRED + option chain
 
 Run from the project root:
     python demo.py
@@ -17,6 +17,7 @@ Run from the project root:
 import sys
 import os
 import time
+import datetime
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -25,6 +26,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 sns.set_theme(style="whitegrid", palette="muted")
+
+# Valuation date — set to None for "most recent", or an ISO date string for a sample run
+VALUATION_DATE = None  # e.g. "2026-04-08"
+if VALUATION_DATE is None:
+    VALUATION_DATE = datetime.date.today()
+else:
+    VALUATION_DATE = datetime.date.fromisoformat(VALUATION_DATE)
+
+from python.data._cache import prune_cache
+prune_cache(VALUATION_DATE)
 
 os.makedirs("output", exist_ok=True)
 
@@ -40,13 +51,19 @@ if not FRED_API_KEY:
     print("[FATAL] FRED_API_KEY not set. Add it to .env or export it.")
     sys.exit(1)
 
-TICKER = "SPY"
+DATABENTO_API_KEY = os.environ.get("DATABENTO_API_KEY")
+if not DATABENTO_API_KEY:
+    print("[FATAL] DATABENTO_API_KEY not set. Add it to .env or export it.")
+    sys.exit(1)
+
+TICKER = "SPX"
 
 # ---------------------------------------------------------------------------
 # 0. Verify C++ engine
 # ---------------------------------------------------------------------------
 print("=" * 70)
 print("QR EQUITY DERIVATIVES FLOW - PROJECT DEMO")
+print("PID: %d  (use this to attach C++ debugger)" % os.getpid())
 print("=" * 70)
 
 try:
@@ -82,7 +99,7 @@ w_vec = surface_vec(k_vec, theta, rho, eta)
 print("  surface_vec over 7 strikes: min=%.6f, max=%.6f" % (min(w_vec), max(w_vec)))
 
 # Greeks
-F, K, T, r, sigma = 585.0, 590.0, 0.25, 0.045, 0.18
+F, K, T, r, sigma = 5850.0, 5900.0, 0.25, 0.045, 0.18
 call_px = bs_price(F, K, T, r, sigma, True)
 put_px = bs_price(F, K, T, r, sigma, False)
 print("  BS call(F=%.0f, K=%.0f, T=%.2f, sigma=%.0f%%) = $%.4f" % (F, K, T, sigma * 100, call_px))
@@ -107,7 +124,7 @@ print("-" * 70)
 
 from python.data.fred_rates import fetch_yield_curve
 
-curve = fetch_yield_curve(FRED_API_KEY)
+curve = fetch_yield_curve(FRED_API_KEY, valuation_date=VALUATION_DATE)
 print("  [LIVE] Fetched yield curve from FRED (as of %s)" % curve.as_of_date)
 
 for t, r_val in zip([0.25, 1.0, 5.0, 10.0], [curve.rate(x) for x in [0.25, 1.0, 5.0, 10.0]]):
@@ -126,15 +143,15 @@ plt.close()
 print("  Saved output/01_yield_curve.png")
 
 # ---------------------------------------------------------------------------
-# 3. Option Chain (yfinance)
+# 3. Option Chain (Databento)
 # ---------------------------------------------------------------------------
 print("\n" + "-" * 70)
-print("3. OPTION CHAIN (yfinance)")
+print("3. OPTION CHAIN (Databento)")
 print("-" * 70)
 
-from python.data.options_chain import fetch_yfinance
+from python.data.databento_chain import fetch_databento
 
-chain = fetch_yfinance(TICKER)
+chain = fetch_databento(TICKER, valuation_date=VALUATION_DATE)
 spot = chain.spot
 print("  [LIVE] Fetched %d quotes across %d expiries for %s (spot=%.2f)"
       % (len(chain.quotes), len(chain.expiries()), TICKER, spot))
@@ -144,53 +161,32 @@ for exp in chain.expiries():
     T_exp = (exp - pd.Timestamp.now()).days / 365.25
     print("    %s (T=%.3fy): %d quotes" % (exp.date(), T_exp, n))
 
+# Note: valid expiry check moved to after forward curve extraction (section 4).
+
 # ---------------------------------------------------------------------------
-# 4. Dividend Projection + Implied Dividends
+# 4. Forward Curve (Implied from Put-Call Parity)
 # ---------------------------------------------------------------------------
 print("\n" + "-" * 70)
-print("4. DIVIDEND PROJECTION + IMPLIED DIVIDENDS")
+print("4. FORWARD CURVE (IMPLIED FROM PUT-CALL PARITY)")
 print("-" * 70)
 
-from python.data.dividends import (
-    fetch_dividends, project_from_history, extract_implied_dividends,
-    decompose_implied_dividends, blend_dividends, build_forward_curve,
-)
+from python.data.dividends import build_forward_curve_index
 
-# 4a. Historical projection
-hist_divs = fetch_dividends(TICKER, period="3y")
-print("  [LIVE] Fetched %d historical dividends for %s" % (len(hist_divs), TICKER))
-
-projected_hist = project_from_history(hist_divs, horizon_years=1.5)
-print("  Projected %d future dividends (historical):" % len(projected_hist))
-for d in projected_hist[:4]:
-    print("    %s: $%.2f (%s)" % (d.ex_date.date(), d.amount, d.source))
-
-# 4b. Market-implied dividends via put-call parity
-implied_pvs = extract_implied_dividends(chain, curve)
-print("  Implied cumulative div PV per expiry:")
-for exp in sorted(implied_pvs.keys()):
-    print("    %s: PV=$%.4f" % (exp.date(), implied_pvs[exp]))
-
-implied_divs = decompose_implied_dividends(implied_pvs, projected_hist, spot, curve)
-print("  Decomposed into %d implied dividends:" % len([d for d in implied_divs if d.source == "implied"]))
-for d in [dd for dd in implied_divs if dd.source == "implied"][:4]:
-    print("    %s: $%.2f (%s)" % (d.ex_date.date(), d.amount, d.source))
-
-# 4c. Blend: prefer market-implied where available
-projected = blend_dividends(projected_hist, implied_divs, method="prefer_implied")
-print("  Blended dividend schedule (%d total):" % len(projected))
-for d in projected[:6]:
-    print("    %s: $%.2f (%s)" % (d.ex_date.date(), d.amount, d.source))
-
-# 4d. Forward curve from blended dividends
-forwards = build_forward_curve(spot, projected, curve, chain.expiries())
-forwards_hist_only = build_forward_curve(spot, projected_hist, curve, chain.expiries())
-print("  Forward curve (hist vs implied-adjusted):")
+forwards, fwd_curve = build_forward_curve_index(spot, chain, curve)
+print("  Implied forward curve for %s (via put-call parity):" % TICKER)
+print("  Bootstrapped dividend yield term structure q(T):")
 for exp in sorted(forwards.keys()):
     T_exp = (exp - pd.Timestamp.now()).days / 365.25
-    print("    %s (T=%.3fy): F_hist=%.2f  F_implied=%.2f  diff=%.2f"
-          % (exp.date(), T_exp, forwards_hist_only[exp], forwards[exp],
-             forwards[exp] - forwards_hist_only[exp]))
+    q_exp = fwd_curve.div_yield_at(T_exp)
+    r_exp = curve.rate(T_exp)
+    print("    %s (T=%.3fy): F=%.2f  r=%.3f%%  q=%.3f%%  r-q=%.3f%%"
+          % (exp.date(), T_exp, forwards[exp],
+             r_exp * 100, q_exp * 100, (r_exp - q_exp) * 100))
+
+valid_expiries = sorted(set(chain.expiries()) & set(forwards.keys()))
+if len(valid_expiries) < 3:
+    print("[FATAL] Need at least 3 expiries with valid forwards; got %d" % len(valid_expiries))
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # 5. SSVI Surface Calibration + Arb Detection
@@ -232,7 +228,7 @@ for T_cal in sorted(surface.params_by_tenor.keys()):
     ax.plot(k_grid, ivs, label="T=%.2fy" % T_cal)
 ax.set_xlabel("Log-moneyness k")
 ax.set_ylabel("Implied Vol (%)")
-ax.set_title("Calibrated SSVI Volatility Surface")
+ax.set_title("Calibrated SSVI Volatility Surface (%s)" % TICKER)
 ax.legend(fontsize=8)
 plt.tight_layout()
 plt.savefig("output/02_vol_surface.png", dpi=150)
@@ -254,7 +250,7 @@ ax.plot_surface(K_mesh, T_mesh, IV_mesh, cmap="coolwarm", alpha=0.85, edgecolor=
 ax.set_xlabel("Log-moneyness k")
 ax.set_ylabel("Tenor (years)")
 ax.set_zlabel("Implied Vol (%)")
-ax.set_title("SSVI Surface (3D)")
+ax.set_title("SSVI Surface (3D) — %s" % TICKER)
 ax.view_init(elev=30, azim=-60)
 ax.tick_params(axis="z", pad=8)
 ax.zaxis.labelpad = 2
@@ -270,12 +266,12 @@ print("\n" + "-" * 70)
 print("6. GREEKS COMPUTATION")
 print("-" * 70)
 
-sample_expiry = chain.expiries()[2]
+sample_expiry = valid_expiries[2]
 T_greeks = (sample_expiry - pd.Timestamp.now()).days / 365.25
 F_greeks = forwards[sample_expiry]
 r_greeks = curve.rate(T_greeks)
 
-strikes_greeks = np.arange(spot * 0.90, spot * 1.10 + 1, 2.5)
+strikes_greeks = np.arange(spot * 0.90, spot * 1.10 + 1, 25.0)
 greek_rows = []
 for K_g in strikes_greeks:
     k_log = np.log(K_g / F_greeks)
@@ -298,7 +294,7 @@ for ax, col in zip(axes.flat, ["delta", "gamma", "vega", "theta", "vanna", "volg
     ax.set_title(col.capitalize())
     ax.set_xlabel("Strike")
     ax.axvline(spot, color="gray", linestyle="--", alpha=0.5)
-fig.suptitle("Greeks vs Strike (T=%.2fy)" % T_greeks, fontsize=14)
+fig.suptitle("Greeks vs Strike (T=%.2fy) — %s" % (T_greeks, TICKER), fontsize=14)
 plt.tight_layout()
 plt.savefig("output/04_greeks.png", dpi=150)
 plt.close()
@@ -313,9 +309,12 @@ print("-" * 70)
 
 from python.risk.risk_ladder import compute_risk_ladder
 
+K_lo = round((spot - 100) / 50) * 50
+K_mid = round(spot / 50) * 50
+K_hi = round((spot + 100) / 50) * 50
 positions = []
-for K_pos, qty, is_c in [(580, 100, True), (590, -200, True), (600, 100, False)]:
-    exp = chain.expiries()[2]
+for K_pos, qty, is_c in [(K_lo, 100, True), (K_mid, -200, True), (K_hi, 100, False)]:
+    exp = valid_expiries[2]
     T_pos = (exp - pd.Timestamp.now()).days / 365.25
     positions.append({
         "strike": float(K_pos), "expiry_years": T_pos,
@@ -341,7 +340,7 @@ sns.heatmap(
 )
 ax.set_xlabel("Spot Level")
 ax.set_ylabel("Vol Shock")
-ax.set_title("Portfolio P&L Risk Ladder")
+ax.set_title("Portfolio P&L Risk Ladder — %s" % TICKER)
 plt.tight_layout()
 plt.savefig("output/05_risk_ladder.png", dpi=150)
 plt.close()
@@ -379,9 +378,15 @@ base_portfolio = portfolio_pnl[len(portfolio_pnl) // 2]
 portfolio_pnl = np.array(portfolio_pnl) - base_portfolio
 
 # Hedge universe
+hedge_strikes = [
+    (round((spot - 200) / 50) * 50, True),
+    (round((spot - 50) / 50) * 50, True),
+    (round((spot + 100) / 50) * 50, False),
+    (round((spot + 200) / 50) * 50, False),
+]
 hedge_universe = []
-for K_hu, is_c in [(570, True), (585, True), (600, False), (610, False)]:
-    exp = chain.expiries()[2]
+for K_hu, is_c in hedge_strikes:
+    exp = valid_expiries[2]
     T_hu = (exp - pd.Timestamp.now()).days / 365.25
     hedge_universe.append({
         "strike": float(K_hu), "expiry_years": T_hu,
@@ -392,7 +397,18 @@ hedge_pnl = build_scenario_pnl_matrix(
     hedge_universe, spot_shocks, vol_shocks,
     surface.implied_vol, bs_price, curve.rate, spot,
 )
-hedge_costs = np.array([0.10, 0.15, 0.12, 0.08])
+# Derive hedge costs from live bid-ask spreads
+hedge_costs = []
+exp = valid_expiries[2]
+for inst in hedge_universe:
+    best_spread = None
+    for q in chain.for_expiry(exp):
+        if q.is_call == inst["is_call"] and abs(q.strike - inst["strike"]) < 1.0:
+            best_spread = q.spread() / 2.0
+            break
+    hedge_costs.append(best_spread if best_spread is not None else 0.10)
+hedge_costs = np.array(hedge_costs)
+print("  Hedge costs (half-spread): %s" % hedge_costs)
 
 frontier = compute_efficient_frontier(portfolio_pnl, hedge_pnl, hedge_costs, budget_steps=25)
 
@@ -406,50 +422,35 @@ fig, ax = plt.subplots(figsize=(10, 5))
 ax.plot(costs_f, variances_f, "o-", color="#2E75B6", linewidth=2, markersize=5)
 ax.set_xlabel("Transaction Cost ($)")
 ax.set_ylabel("Residual Portfolio Variance")
-ax.set_title("Hedging Efficient Frontier")
+ax.set_title("Hedging Efficient Frontier — %s" % TICKER)
 plt.tight_layout()
 plt.savefig("output/06_efficient_frontier.png", dpi=150)
 plt.close()
 print("  Saved output/06_efficient_frontier.png")
 
 # ---------------------------------------------------------------------------
-# 9. ETF Premium Analysis
+# 9. ML WARM-START (SYNTHETIC DEMO)
 # ---------------------------------------------------------------------------
 print("\n" + "-" * 70)
-print("9. ETF PREMIUM / DISCOUNT ANALYSIS")
+print("9. ML WARM-START (SYNTHETIC DEMO)")
 print("-" * 70)
 
-from python.models.etf_premium import estimate_premium, adjust_surface_for_premium
+from python.ml.warm_start import WarmStartModel, extract_live_features
 
-nav = spot * 0.998
-nav_fwd = forwards[chain.expiries()[2]] * (nav / spot)
-premium = estimate_premium(spot, nav, forwards[chain.expiries()[2]], nav_fwd, T_greeks)
-print("  %s" % premium["description"])
-
-raw_iv = 0.18
-adj_iv = adjust_surface_for_premium(raw_iv, premium["spot_premium_pct"], T_greeks)
-print("  Raw IV: %.2f%% -> Premium-adjusted IV: %.2f%%" % (raw_iv * 100, adj_iv * 100))
-
-# ---------------------------------------------------------------------------
-# 10. ML WARM-START (SYNTHETIC DEMO)
-# ---------------------------------------------------------------------------
-print("\n" + "-" * 70)
-print("10. ML WARM-START (SYNTHETIC DEMO)")
-print("-" * 70)
-
-from python.ml.warm_start import WarmStartModel
+live_feat = extract_live_features(curve, chain, FRED_API_KEY)
+print("  Live features: %s" % {k: round(v, 4) for k, v in live_feat.items()})
 
 # Build synthetic training data from the already-calibrated surface
 print("  Building synthetic training set from calibrated surface ...")
 train_rows = []
 rng = np.random.default_rng(42)
 for i in range(200):
-    vix = 15.0 + rng.normal(0, 5)
-    slope = 0.01 + rng.normal(0, 0.005)
-    rvol_1d = 0.15 + rng.normal(0, 0.03)
-    rvol_5d = 0.14 + rng.normal(0, 0.025)
-    rvol_20d = 0.13 + rng.normal(0, 0.02)
-    pcr = 0.8 + rng.normal(0, 0.15)
+    vix = max(live_feat["vix"] + rng.normal(0, 5), 1.0)
+    slope = live_feat["yield_slope_10y_2y"] + rng.normal(0, 0.005)
+    rvol_1d = live_feat["rvol_1d"] + rng.normal(0, 0.03)
+    rvol_5d = live_feat["rvol_5d"] + rng.normal(0, 0.025)
+    rvol_20d = live_feat["rvol_20d"] + rng.normal(0, 0.02)
+    pcr = live_feat["put_call_volume_ratio"] + rng.normal(0, 0.15)
     for T_train, params_train in surface.params_by_tenor.items():
         theta_prev = params_train.theta * (1 + rng.normal(0, 0.05))
         rho_prev = np.clip(params_train.rho + rng.normal(0, 0.02), -0.99, 0.99)
@@ -474,11 +475,7 @@ print("  [OK] WarmStartModel trained")
 # Re-calibrate with ML warm-start
 from python.models.surface import calibrate_surface, _prepare_slices
 
-features = {
-    "vix": 18.0, "yield_slope_10y_2y": 0.012,
-    "rvol_1d": 0.16, "rvol_5d": 0.15, "rvol_20d": 0.14,
-    "put_call_volume_ratio": 0.85,
-}
+features = live_feat
 
 # Classical (cold start, no prior surface)
 t0 = time.perf_counter()
@@ -529,8 +526,8 @@ print("DEMO COMPLETE")
 print("=" * 70)
 print("  Data sources:")
 print("    Yield curve:   FRED (as of %s)" % curve.as_of_date)
-print("    Option chain:  yfinance (%s, spot=%.2f)" % (TICKER, spot))
-print("    Dividends:     yfinance (%s, %d historical)" % (TICKER, len(hist_divs)))
+print("    Option chain:  Databento (%s, spot=%.2f)" % (TICKER, spot))
+print("    Forward curve: Implied from put-call parity, q(T) bootstrapped")
 print("  All plots saved in output/ directory:")
 print("    01_yield_curve.png")
 print("    02_vol_surface.png")

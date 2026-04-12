@@ -70,7 +70,7 @@ class TestOptionChain(unittest.TestCase):
             OptionQuote(100, exp1, False, 3.0, 3.5, 100, 600),
             OptionQuote(100, exp2, True, 8.0, 8.5, 300, 1500),
         ]
-        self.chain = OptionChain("SPY", spot=102.0, quotes=self.quotes,
+        self.chain = OptionChain("SPX", spot=5800.0, quotes=self.quotes,
                                  as_of="2026-02-22")
 
     def test_expiries_sorted(self):

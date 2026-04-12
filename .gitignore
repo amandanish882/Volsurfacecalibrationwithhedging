@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Build artifacts
+cpp/build/
+cpp/dbg_build/
+*.o
+*.dSYM/
+*.pdb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache & output
+cache/*.pkl
+# output/*.png  — README images tracked; re-enable to ignore generated outputs
+!output/01_yield_curve.png
+!output/04_greeks.png
+!output/05_risk_ladder.png
+!output/06_efficient_frontier.png
+output/*.pkl
+
+# Test cache
+.pytest_cache/

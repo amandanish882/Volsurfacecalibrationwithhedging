@@ -66,4 +66,15 @@ GreekResult compute(double F, double K, double T, double r, double sigma,
                     double dSigma  = 0.005,
                     double dT      = 1.0/365.0);
 
+/**
+ * Vectorised implied vol: solves for each element in parallel (in C++).
+ */
+std::vector<double> bs_implied_vol_vec(
+    const std::vector<double>& prices,
+    const std::vector<double>& Fs,
+    const std::vector<double>& Ks,
+    double T, double r,
+    const std::vector<bool>& is_calls,
+    double tol = 1e-8, int max_iter = 100);
+
 } // namespace greeks

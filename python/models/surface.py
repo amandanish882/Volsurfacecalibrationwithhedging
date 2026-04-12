@@ -16,7 +16,7 @@ from python.types import SSVIParams, FittedSurface
 from python.models.arb_detector import check_calendar, check_butterfly
 
 from qr_engine.ssvi import surface_vec
-from qr_engine.greeks import bs_implied_vol
+from qr_engine.greeks import bs_implied_vol_vec
 
 
 def _eval_surface(k_arr, theta, rho, eta):
@@ -28,10 +28,11 @@ def calibrate_single_slice(k, market_w, weights, prev_params=None,
     """Fit SSVI to a single tenor slice. Returns SSVIParams.
 
     When *warm_started* is True the initial guess is ML-predicted and
-    already close to the optimum, so we use a looser tolerance / fewer
-    iterations to capitalise on the better starting point.  The
-    tolerance (1e-8) still gives ~8 significant digits on the
-    objective — more than enough given bid-ask noise on market_w.
+    already close to the optimum, so we use fewer iterations
+    (80 vs 500) to capitalise on the better starting point.  The
+    convergence tolerance (1e-8) is the same for both paths and
+    gives ~8 significant digits on the objective — more than enough
+    given bid-ask noise on market_w.
     """
     if prev_params is not None:
         x0 = [prev_params.theta, prev_params.rho, prev_params.eta]
@@ -51,13 +52,16 @@ def calibrate_single_slice(k, market_w, weights, prev_params=None,
 
     res = minimize(obj, x0, bounds=bounds, method="L-BFGS-B",
                    options=opts)
+    if not res.success:
+        print("  [surface] WARNING: slice optimization did not converge; using initial guess.")
+        return SSVIParams(theta=x0[0], rho=x0[1], eta=x0[2])
     return SSVIParams(theta=res.x[0], rho=res.x[1], eta=res.x[2])
 
 
 def _prepare_slices(chain, forwards, curve):
     """Convert raw option chain into optimizer-ready slice data.
 
-    This is the expensive step (one ``bs_implied_vol`` call per quote).
+    This is the expensive step (one implied vol solve per quote).
     The result is a list of dicts, one per valid tenor slice, each
     containing the log-moneyness array *k*, the market total variance
     *market_w*, the weight vector *weights*, and the tenor *T*.
@@ -77,11 +81,12 @@ def _prepare_slices(chain, forwards, curve):
         k = np.log(strikes / F)
         mids = np.array([q.mid() for q in slice_quotes])
 
-        # Implied vols via C++ engine — this is the dominant cost
-        ivs = np.array([
-            bs_implied_vol(m, F, K, T, curve.rate(T), q.is_call)
-            for m, K, q in zip(mids, strikes, slice_quotes)
-        ])
+        # Implied vols via vectorised C++ engine
+        is_calls = [q.is_call for q in slice_quotes]
+        Fs = [F] * len(slice_quotes)
+        ivs = np.array(bs_implied_vol_vec(
+            mids.tolist(), Fs, strikes.tolist(), T, curve.rate(T), is_calls
+        ))
 
         valid = (ivs > 0.01) & (ivs < 3.0) & np.isfinite(ivs)
         if valid.sum() < 5:
@@ -93,8 +98,10 @@ def _prepare_slices(chain, forwards, curve):
         # Vega x volume weights
         vols = np.array([q.volume for q in slice_quotes])[valid].astype(float)
         vols = np.maximum(vols, 1.0)
-        vega_proxy = ivs * np.sqrt(T)
-        weights = vega_proxy * np.log1p(vols)
+        r_T = curve.rate(T)
+        d1 = (np.log(F / strikes[valid]) + 0.5 * ivs**2 * T) / (ivs * np.sqrt(T))
+        vega = F * np.exp(-r_T * T) * np.sqrt(T) * np.exp(-0.5 * d1**2) / np.sqrt(2 * np.pi)
+        weights = vega * np.log1p(vols)
         weights = weights / weights.sum()
 
         slices.append({"T": T, "k": k, "market_w": market_w, "weights": weights})

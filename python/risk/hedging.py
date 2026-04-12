@@ -76,11 +76,16 @@ def compute_efficient_frontier(portfolio_pnl_scenarios, hedge_pnl_matrix,
             options={"maxiter": 300, "ftol": 1e-10},
         )
 
+        if res.success:
+            quantities = res.x
+        else:
+            quantities = np.zeros(n_inst)
+
         frontier.append({
             "budget": float(budget),
-            "residual_variance": float(res.fun),
-            "optimal_quantities": np.round(res.x, 4).tolist(),
-            "actual_cost": float(np.sum(np.abs(res.x) * hedge_costs)),
+            "residual_variance": float(objective(quantities)),
+            "optimal_quantities": np.round(quantities, 4).tolist(),
+            "actual_cost": float(np.sum(np.abs(quantities) * hedge_costs)),
         })
 
     return frontier

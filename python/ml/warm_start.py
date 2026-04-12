@@ -176,6 +176,34 @@ def build_training_set(calibration_log, market_features_log):
     return merged
 
 
+def _atm_iv_at_tenor(chain, curve, target_days=30):
+    """Find the near-ATM call closest to target_days and return its IV."""
+    from qr_engine.greeks import bs_implied_vol as _bs_iv
+    best = None
+    for q in chain.quotes:
+        if not q.is_call:
+            continue
+        days = (q.expiry - pd.Timestamp.now()).days
+        if days < 2:
+            continue
+        tenor_dist = abs(days - target_days)
+        moneyness = abs(q.strike / chain.spot - 1.0)
+        score = tenor_dist / 30.0 + moneyness  # prefer close tenor + ATM
+        if best is None or score < best[0]:
+            best = (score, q)
+    if best is None:
+        return None
+    q = best[1]
+    T = (q.expiry - pd.Timestamp.now()).days / 365.25
+    try:
+        iv = _bs_iv(q.mid(), chain.spot, q.strike, T, curve.rate(T), True)
+        if 0.01 < iv < 3.0:
+            return iv
+    except Exception:
+        pass
+    return None
+
+
 def extract_live_features(curve, chain, fred_api_key=None):
     """
     Compute the market-feature vector for the current snapshot
@@ -233,10 +261,12 @@ def extract_live_features(curve, chain, fred_api_key=None):
     put_vol  = sum(q.volume for q in chain.quotes if not q.is_call)
     pc_ratio = put_vol / max(call_vol, 1.0)
 
-    # Realised vol placeholders — in production these come from a spot
-    # history time series. Here we estimate from intraday chain data:
-    # ATM IV at different tenors as a proxy for realised vol at those horizons.
-    rvol_1d, rvol_5d, rvol_20d = vix / 100.0, vix / 100.0, vix / 100.0
+    # Realised vol proxies from ATM implied vols at different tenors.
+    # In production, compute from historical daily closes. Here we use
+    # near-ATM IV at short tenors as a reasonable proxy.
+    rvol_1d = _atm_iv_at_tenor(chain, curve, target_days=5) or vix / 100.0
+    rvol_5d = _atm_iv_at_tenor(chain, curve, target_days=10) or vix / 100.0
+    rvol_20d = _atm_iv_at_tenor(chain, curve, target_days=30) or vix / 100.0
 
     return {
         "vix": vix,

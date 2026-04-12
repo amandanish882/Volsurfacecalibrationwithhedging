@@ -1,193 +1,159 @@
+
 """
 test_dividends.py
 =================
-Unit tests for dividend projection and forward curve building.
-No network access needed — uses hardcoded test data.
+Unit tests for implied forward curve building via put-call parity.
+No network access needed — uses synthetic test data.
 """
 
 import unittest
 import numpy as np
 import pandas as pd
 
-from python.types import YieldCurve, DiscreteDividend, OptionQuote, OptionChain
+from python.types import YieldCurve, OptionQuote, OptionChain
 from python.data.dividends import (
-    project_from_history, build_forward_curve,
-    decompose_implied_dividends, blend_dividends,
+    build_forward_curve_index, ForwardCurve, _extract_implied_forward,
 )
 
 
-class TestProjectFromHistory(unittest.TestCase):
+def _make_synthetic_chain(spot, curve, div_yield, expiries):
+    """
+    Build a synthetic option chain where put-call parity holds exactly
+    with a known continuous dividend yield q.
 
-    def setUp(self):
-        self.hist = pd.DataFrame({
-            "ex_date": pd.date_range("2025-03-15", periods=8, freq="QS"),
-            "amount": [1.65, 1.65, 1.70, 1.70, 1.75, 1.75, 1.78, 1.78],
-        })
+    F(T) = S * exp((r - q) * T)
+    C - P = exp(-rT) * (F - K) = exp(-rT) * (S*exp((r-q)*T) - K)
+    """
+    quotes = []
+    for expiry in expiries:
+        T = (expiry - pd.Timestamp.now()).days / 365.25
+        if T < 0.01:
+            continue
+        r = curve.rate(T)
+        F = spot * np.exp((r - div_yield) * T)
 
-    def test_returns_list(self):
-        result = project_from_history(self.hist, horizon_years=1.0)
-        self.assertIsInstance(result, list)
+        # Create ATM and near-ATM strikes
+        for K in [spot * 0.95, spot * 0.98, spot, spot * 1.02, spot * 1.05]:
+            # Approximate BS prices for mid (enough for put-call parity test)
+            # Use simple intrinsic + time value approximation
+            sigma = 0.18
+            d1 = (np.log(F / K) + 0.5 * sigma ** 2 * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            from scipy.stats import norm
+            call_px = np.exp(-r * T) * (F * norm.cdf(d1) - K * norm.cdf(d2))
+            put_px = np.exp(-r * T) * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
 
-    def test_all_future(self):
-        result = project_from_history(self.hist, horizon_years=2.0)
-        now = pd.Timestamp.now()
-        for d in result:
-            self.assertGreater(d.ex_date, now)
+            # Add small spread
+            spread = 0.50
+            quotes.append(OptionQuote(
+                strike=K, expiry=expiry, is_call=True,
+                bid=max(call_px - spread / 2, 0.01),
+                ask=call_px + spread / 2,
+                volume=1000, open_interest=5000,
+            ))
+            quotes.append(OptionQuote(
+                strike=K, expiry=expiry, is_call=False,
+                bid=max(put_px - spread / 2, 0.01),
+                ask=put_px + spread / 2,
+                volume=800, open_interest=4000,
+            ))
 
-    def test_amount_is_average_of_recent(self):
-        result = project_from_history(self.hist, horizon_years=1.0)
-        if result:
-            expected_avg = self.hist.tail(4)["amount"].mean()
-            self.assertAlmostEqual(result[0].amount, expected_avg, places=4)
-
-    def test_source_label(self):
-        result = project_from_history(self.hist, horizon_years=1.0)
-        for d in result:
-            self.assertEqual(d.source, "historical")
-
-    def test_empty_history_handles_gracefully(self):
-        empty = pd.DataFrame({"ex_date": pd.Series([], dtype="datetime64[ns]"),
-                               "amount": pd.Series([], dtype="float64")})
-        # Empty history should either return empty or raise — not crash unexpectedly
-        try:
-            result = project_from_history(empty, horizon_years=1.0)
-            self.assertEqual(len(result), 0)
-        except (IndexError, ValueError):
-            pass  # acceptable: no data to project from
+    return OptionChain("SPX", spot, quotes, str(pd.Timestamp.now().date()))
 
 
-class TestBuildForwardCurve(unittest.TestCase):
+class TestExtractImpliedForward(unittest.TestCase):
 
     def setUp(self):
         tenors = np.array([0.25, 1.0, 2.0, 5.0])
         rates = np.array([0.04, 0.042, 0.045, 0.048])
         self.curve = YieldCurve(tenors, rates, "2026-02-22")
-        self.spot = 600.0
+        self.spot = 5800.0
+        self.div_yield = 0.014  # ~1.4%
         self.expiries = [
             pd.Timestamp.now() + pd.DateOffset(months=3),
             pd.Timestamp.now() + pd.DateOffset(months=6),
             pd.Timestamp.now() + pd.DateOffset(months=12),
         ]
+        self.chain = _make_synthetic_chain(
+            self.spot, self.curve, self.div_yield, self.expiries,
+        )
 
-    def test_no_dividends_forward_above_spot(self):
-        forwards = build_forward_curve(self.spot, [], self.curve, self.expiries)
-        for exp in self.expiries:
-            self.assertGreater(forwards[exp], self.spot)
+    def test_implied_forward_recovers_true_forward(self):
+        """Implied forward from put-call parity should match F = S*exp((r-q)*T)."""
+        for expiry in self.expiries:
+            result = _extract_implied_forward(self.chain, self.curve, expiry)
+            self.assertIsNotNone(result)
+            T, F_impl = result
+            r = self.curve.rate(T)
+            F_true = self.spot * np.exp((r - self.div_yield) * T)
+            # Should be close (within bid-ask noise)
+            self.assertAlmostEqual(F_impl, F_true, delta=F_true * 0.002)
 
-    def test_dividends_reduce_forward(self):
-        no_div_fwd = build_forward_curve(self.spot, [], self.curve, self.expiries)
-        divs = [
-            DiscreteDividend(pd.Timestamp.now() + pd.DateOffset(months=1), 2.0),
-            DiscreteDividend(pd.Timestamp.now() + pd.DateOffset(months=4), 2.0),
-        ]
-        with_div_fwd = build_forward_curve(self.spot, divs, self.curve, self.expiries)
-        # Forwards with dividends should be lower
-        for exp in self.expiries:
-            self.assertLess(with_div_fwd[exp], no_div_fwd[exp])
-
-    def test_forward_keys_match_expiries(self):
-        forwards = build_forward_curve(self.spot, [], self.curve, self.expiries)
-        self.assertEqual(set(forwards.keys()), set(self.expiries))
+    def test_returns_none_for_short_expiry(self):
+        short_exp = pd.Timestamp.now() + pd.Timedelta(days=3)
+        result = _extract_implied_forward(self.chain, self.curve, short_exp)
+        self.assertIsNone(result)
 
 
-class TestDecomposeImpliedDividends(unittest.TestCase):
+class TestBuildForwardCurveIndex(unittest.TestCase):
 
     def setUp(self):
         tenors = np.array([0.25, 1.0, 2.0, 5.0])
         rates = np.array([0.04, 0.042, 0.045, 0.048])
         self.curve = YieldCurve(tenors, rates, "2026-02-22")
-        self.spot = 600.0
-        now = pd.Timestamp.now()
-
-        self.exp1 = now + pd.DateOffset(months=3)
-        self.exp2 = now + pd.DateOffset(months=6)
-
-        self.implied_pvs = {
-            self.exp1: 2.0,
-            self.exp2: 4.5,
-        }
-
-        self.hist = [
-            DiscreteDividend(now + pd.DateOffset(months=1), 1.80, source="historical"),
-            DiscreteDividend(now + pd.DateOffset(months=4), 1.80, source="historical"),
-            DiscreteDividend(now + pd.DateOffset(months=7), 1.80, source="historical"),
+        self.spot = 5800.0
+        self.div_yield = 0.014
+        self.expiries = [
+            pd.Timestamp.now() + pd.DateOffset(months=3),
+            pd.Timestamp.now() + pd.DateOffset(months=6),
+            pd.Timestamp.now() + pd.DateOffset(months=12),
         ]
-
-    def test_returns_list_of_discrete_dividends(self):
-        result = decompose_implied_dividends(
-            self.implied_pvs, self.hist, self.spot, self.curve
+        self.chain = _make_synthetic_chain(
+            self.spot, self.curve, self.div_yield, self.expiries,
         )
-        self.assertIsInstance(result, list)
-        for d in result:
-            self.assertIsInstance(d, DiscreteDividend)
 
-    def test_implied_source_within_expiry_range(self):
-        result = decompose_implied_dividends(
-            self.implied_pvs, self.hist, self.spot, self.curve
-        )
-        implied = [d for d in result if d.source == "implied"]
-        self.assertGreater(len(implied), 0)
+    def test_returns_dict_and_curve(self):
+        fwd_dict, fwd_curve = build_forward_curve_index(self.spot, self.chain, self.curve)
+        self.assertIsInstance(fwd_dict, dict)
+        self.assertIsInstance(fwd_curve, ForwardCurve)
 
-    def test_historical_tail_preserved(self):
-        result = decompose_implied_dividends(
-            self.implied_pvs, self.hist, self.spot, self.curve
-        )
-        tail = [d for d in result if d.ex_date > self.exp2]
-        for d in tail:
-            self.assertEqual(d.source, "historical")
+    def test_forward_dict_keys_match_expiries(self):
+        fwd_dict, _ = build_forward_curve_index(self.spot, self.chain, self.curve)
+        for exp in self.expiries:
+            self.assertIn(exp, fwd_dict)
 
-    def test_total_pv_matches_last_expiry(self):
-        result = decompose_implied_dividends(
-            self.implied_pvs, self.hist, self.spot, self.curve
-        )
+    def test_implied_div_yield_is_realistic(self):
+        """Bootstrapped q(T) should be close to the true dividend yield."""
+        _, fwd_curve = build_forward_curve_index(self.spot, self.chain, self.curve)
+        for T in [0.25, 0.5, 1.0]:
+            q = fwd_curve.div_yield_at(T)
+            self.assertAlmostEqual(q, self.div_yield, delta=0.005)
+
+    def test_forward_below_naive_no_div_forward(self):
+        """Implied forward should be below S*exp(rT) due to dividends."""
+        fwd_dict, _ = build_forward_curve_index(self.spot, self.chain, self.curve)
         now = pd.Timestamp.now()
-        total_pv = 0.0
-        for d in result:
-            if d.ex_date <= self.exp2 and d.source == "implied":
-                T_d = (d.ex_date - now).days / 365.25
-                r = self.curve.rate(max(T_d, 0.001))
-                total_pv += d.amount * np.exp(-r * T_d)
-        self.assertAlmostEqual(total_pv, 4.5, places=1)
+        for exp, F_impl in fwd_dict.items():
+            T = (exp - now).days / 365.25
+            r = self.curve.rate(T)
+            F_no_div = self.spot * np.exp(r * T)
+            self.assertLess(F_impl, F_no_div)
 
-    def test_empty_implied_returns_historical(self):
-        result = decompose_implied_dividends({}, self.hist, self.spot, self.curve)
-        self.assertEqual(len(result), len(self.hist))
-        for d in result:
-            self.assertEqual(d.source, "historical")
+    def test_continuous_forward_at_arbitrary_tenor(self):
+        """ForwardCurve.forward_at() should work at non-listed tenors."""
+        _, fwd_curve = build_forward_curve_index(self.spot, self.chain, self.curve)
+        # Interpolated tenor between listed expiries
+        F_interp = fwd_curve.forward_at(0.4)
+        self.assertGreater(F_interp, 0)
+        self.assertGreater(F_interp, self.spot * 0.95)
+        self.assertLess(F_interp, self.spot * 1.10)
 
-    def test_amounts_are_positive(self):
-        result = decompose_implied_dividends(
-            self.implied_pvs, self.hist, self.spot, self.curve
-        )
-        for d in result:
-            self.assertGreater(d.amount, 0.0)
-
-
-class TestBlendDividends(unittest.TestCase):
-
-    def setUp(self):
-        now = pd.Timestamp.now()
-        self.hist = [
-            DiscreteDividend(now + pd.DateOffset(months=1), 1.80, source="historical"),
-            DiscreteDividend(now + pd.DateOffset(months=4), 1.80, source="historical"),
-        ]
-        self.implied = [
-            DiscreteDividend(now + pd.DateOffset(months=1), 2.00, source="implied"),
-            DiscreteDividend(now + pd.DateOffset(months=4), 2.10, source="implied"),
-        ]
-
-    def test_prefer_implied_returns_implied(self):
-        result = blend_dividends(self.hist, self.implied, method="prefer_implied")
-        self.assertEqual(len(result), len(self.implied))
-        self.assertAlmostEqual(result[0].amount, 2.00, places=2)
-
-    def test_average_method(self):
-        result = blend_dividends(self.hist, self.implied, method="average")
-        self.assertAlmostEqual(result[0].amount, (1.80 + 2.00) / 2.0, places=2)
-
-    def test_empty_implied_returns_historical(self):
-        result = blend_dividends(self.hist, [], method="prefer_implied")
-        self.assertEqual(len(result), len(self.hist))
+    def test_forward_increases_with_tenor_when_r_gt_q(self):
+        """When r > q, forwards should increase with tenor."""
+        fwd_dict, _ = build_forward_curve_index(self.spot, self.chain, self.curve)
+        fwd_vals = [fwd_dict[exp] for exp in sorted(fwd_dict.keys())]
+        for i in range(len(fwd_vals) - 1):
+            self.assertLess(fwd_vals[i], fwd_vals[i + 1])
 
 
 if __name__ == "__main__":

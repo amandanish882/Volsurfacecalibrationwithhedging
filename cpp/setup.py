@@ -26,7 +26,7 @@ if platform.system() == "Windows":
     ext.extra_compile_args = ["/Od", "/Zi", "/std:c++17", "/EHsc"]
     ext.extra_link_args = ["/DEBUG"]
 else:
-    ext.extra_compile_args = ["-O3", "-std=c++17", "-fvisibility=hidden"]
+    ext.extra_compile_args = ["-O0", "-g", "-std=c++17", "-fvisibility=hidden"]
 
 setup(
     name="qr_engine",

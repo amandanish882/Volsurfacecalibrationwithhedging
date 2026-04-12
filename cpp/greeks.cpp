@@ -73,6 +73,25 @@ double bs_implied_vol(double price, double F, double K, double T, double r,
 }
 
 // ------------------------------------------------------------------ //
+//  Vectorised implied volatility
+// ------------------------------------------------------------------ //
+
+std::vector<double> bs_implied_vol_vec(
+    const std::vector<double>& prices,
+    const std::vector<double>& Fs,
+    const std::vector<double>& Ks,
+    double T, double r,
+    const std::vector<bool>& is_calls,
+    double tol, int max_iter) {
+    const size_t n = prices.size();
+    std::vector<double> result(n);
+    for (size_t i = 0; i < n; ++i) {
+        result[i] = bs_implied_vol(prices[i], Fs[i], Ks[i], T, r, is_calls[i], tol, max_iter);
+    }
+    return result;
+}
+
+// ------------------------------------------------------------------ //
 //  Finite-difference Greeks
 // ------------------------------------------------------------------ //
 

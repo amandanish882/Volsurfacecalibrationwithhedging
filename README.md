@@ -127,7 +127,7 @@ The compiled `qr_engine` module exposes SSVI evaluation and Black-Scholes pricin
 
 **Black-Scholes pricing** — European options on a forward $F$ with strike $K$, expiry $T$, rate $r$, vol $\sigma$:
 
-$$C = e^{-rT}\bigl[F\,\Phi(d_1) - K\,\Phi(d_2)\bigr], \qquad P = e^{-rT}\bigl[K\,\Phi(-d_2) - F\,\Phi(-d_1)\bigr]$$
+$$C = e^{-rT}[F\ \Phi(d_1) - K\ \Phi(d_2)], \qquad P = e^{-rT}[K\ \Phi(-d_2) - F\ \Phi(-d_1)]$$
 
 $$d_1 = \frac{\ln(F/K) + \tfrac{1}{2}\sigma^2 T}{\sigma\sqrt{T}}, \qquad d_2 = d_1 - \sigma\sqrt{T}$$
 
@@ -180,7 +180,7 @@ Bootstrapped from 11 US Treasury par yield series (DGS1MO → DGS30) via **cubic
 
 **Par yield → continuous zero-rate conversion** (semi-annual compounding convention):
 
-$$z(T) = 2\,\ln\!\left(1 + \frac{y_{\text{par}}(T)}{2}\right)$$
+$$z(T) = 2\ \ln\left(1 + \frac{y_{\text{par}}(T)}{2}\right)$$
 
 **Discount factor** at arbitrary tenor $T$ (interpolated via natural cubic spline through 11 knots):
 
@@ -234,7 +234,7 @@ For European index options (SPX), the forward price is extracted directly from p
 
 **Implied forward from put-call parity** — at each expiry $T$ with ATM strike $K$:
 
-$$F(T) = K + e^{rT}\bigl(C_{\text{ATM}} - P_{\text{ATM}}\bigr)$$
+$$F(T) = K + e^{rT}(C_{\text{ATM}} - P_{\text{ATM}})$$
 
 **Dividend yield bootstrap** — continuous yield $q(T)$ implied from the forward:
 
@@ -351,7 +351,7 @@ g = greeks_compute(F_greeks, K_g, T_greeks, r_greeks, sigma_g, True)
 
 Portfolio P&L is computed by **full revaluation** (not Greeks approximation) over a 2D shock grid:
 
-$$\text{P\&L}(i,j) = V\!\bigl(S_0(1+\delta_i^S),\;\sigma + \delta_j^\sigma\bigr) - V(S_0,\,\sigma)$$
+$$\text{PnL}(i,j) = V(S_0(1+\delta_i^S),\ \sigma + \delta_j^\sigma) - V(S_0,\ \sigma)$$
 
 $$\delta^S \in [-10\%,\;+10\%], \qquad \delta^\sigma \in [-5\text{vol},\;+5\text{vol}]$$
 
@@ -383,7 +383,7 @@ Hedge ratios $\mathbf{h} = (h_1, \dots, h_M)$ are optimised via **SLSQP** (Seque
 
 **Objective** — minimise residual P&L variance across all $N$ scenarios:
 
-$$\min_{\mathbf{h}} \;\operatorname{Var}\!\left[\text{P\&L}_{\text{portfolio}} + \sum_{j=1}^{M} h_j\,\text{P\&L}_{\text{hedge}_j}\right]$$
+$$\min_{\mathbf{h}} \ \mathrm{Var}\left[\text{PnL}\_{\text{portfolio}} + \sum_{j=1}^{M} h_j\ \text{PnL}\_{\text{hedge}\_j}\right]$$
 
 **Subject to** a transaction cost budget constraint:
 
